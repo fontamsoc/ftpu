@@ -153,7 +153,7 @@ Set `SRAM_INITFILE` of `make updsram` to a different .hex to use a different app
 
 To rebuild the `rv32-orangecrab0285` bitstream, use `make clean all`.
 
-The bitstreams for the xilinx FPGAs, such as `rv32-artya7100`, need to be built from their Vivado project file (ie: `ftpu/hw/rv32-artya7100/vivado2020/artya7100.xpr`).
+The bitstreams for the xilinx FPGAs, such as `rv32-artya7100`, need to be built from their Vivado project file (ie: `ftpu/hw/rv32-artya7100/vivado/artya7100.xpr`).
 
 ## Build sw toolchain (or [download prebuilt](https://github.com/fontamsoc/ftpu/releases/latest/download/ftpu-toolchain-linux-x64.tar.xz) [![pu32-toolchain](https://github.com/fontamsoc/ftpu/actions/workflows/release.yml/badge.svg)](https://github.com/fontamsoc/ftpu/actions/workflows/release.yml))
 
