@@ -34,6 +34,8 @@
 // 	destination index to target, "rsvd" is reserved and ignored.
 // 	"resp" in the result gets set to the interrupt destination index
 // 	if valid, -2 if not ready due to an interrupt pending ack, or -1 if invalid.
+// 	The destination -1 (all ones) requests a system reset; "resp" in the
+// 	result gets set to -1 as for an invalid destination.
 // 	CMDENAIRQ: Enable/Disable an interrupt source; field "arg" is expected
 // 	to have following format | idx: (WORDBITSZ-3) bits | en: 1 bit |
 // 	where "idx" is the interrupt source index, "en" enables/disables
@@ -82,6 +84,22 @@ static inline uintptr_t hwdrvirqctrl_ena (uintptr_t idx, uintptr_t en) {
 	irqsrc = 0;
 	irqsrc = _xchg(IRQCTRLADDR, irqsrc);
 	return ((intptr_t)irqsrc >> 3);
+}
+
+// Request a system reset, the CMDINTDST destination -1; it never returns.
+// The controller accepts a command only when its previous transaction has
+// been closed: CMDDEVRDY closes whatever transaction another context left
+// open, and the request is accepted exactly when the word it returns has a
+// null "cmd" field, otherwise another context slipped a command in between
+// and the pair is retried; wfi parks the cpu until the reset asserts.
+static inline __attribute__((noreturn)) void hwdrvirqctrl_reset (void) {
+	uintptr_t v;
+	do {
+		(void)_xchg(IRQCTRLADDR, 0);
+		v = _xchg(IRQCTRLADDR, ((((uintptr_t)-1) << 3) | 0b10));
+	} while (v & 0b11);
+	for (;;)
+		__asm__ __volatile__ ("wfi");
 }
 
 #endif /* HWDRVIRQCTRL_H */
