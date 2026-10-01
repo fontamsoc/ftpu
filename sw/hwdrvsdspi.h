@@ -50,6 +50,19 @@ typedef struct hwdrvsdspi {
 #define HWDRVSDSPI_CRC 1
 #endif
 
+// Whether multiple block writes pre-erase their data blocks, 0 by default; the
+// includer may define it before including this file. When non-null, a multiple
+// block write to an SD card, WRITE_MULTIPLE_BLOCK (CMD25), is preceded by
+// SET_WR_BLK_ERASE_COUNT (ACMD23) giving its count of data blocks, which some
+// cards write faster; but when the write stops before its last data block, ie:
+// on a failure, the content of the data blocks not written is undefined, either
+// erased or their previous content. A response R1 to CMD55 or ACMD23 reporting
+// an error fails the write as recoverable, nothing being written. It does not
+// apply to MMC, which is written a block at a time.
+#ifndef HWDRVSDSPI_PREERASE
+#define HWDRVSDSPI_PREERASE 0
+#endif
+
 // The sdspi device is an SD or MMC card in SPI mode, attached to the SPI
 // peripheral dev/spi.sv, which is driven using hwdrvchar.h only; as for
 // hwdrvchar.h, <_os.h> must be included before this file.
@@ -65,10 +78,14 @@ typedef struct hwdrvsdspi {
 // Each command to the card is a single transmission of the device, as
 // described in dev/spi.sv: "cs" remains low from the command through its
 // response and data, the data response of a write and the clock cycles which
-// follow it included. The driver closes every transmission, and writes the
-// next one only once the transmit buffer usage is null. The busy state which
-// follows a write is polled using short transmissions, "cs" rising between
-// them; delays send clock cycles with "cs" high.
+// follow it included; but CMD12 (STOP_TRANSMISSION), which ends a CMD18
+// (READ_MULTIPLE_BLOCK) within the transmission of the CMD18, after its data
+// blocks. A CMD25 (WRITE_MULTIPLE_BLOCK) transmission holds its data blocks, the
+// busy state which follows each, and the Stop Tran token which ends it. The
+// driver closes every transmission, and writes the next one only once the
+// transmit buffer usage is null. The busy state which follows a write, CMD24 or
+// the Stop Tran token, and a CMD12, is polled using short transmissions, "cs"
+// rising between them; delays send clock cycles with "cs" high.
 //
 // The driver never disables preemption: a call may be preempted anywhere, its
 // transmission pausing meanwhile, which is legal for the card. A pause lasting
@@ -83,9 +100,11 @@ typedef struct hwdrvsdspi {
 //
 // The function dev->wait, when non-null, is called only while the card is busy
 // after a write, while clock cycles are sent with "cs" high, ie: the 250 ms
-// after poweron and the 40 ms before each poll of the initialization, and while
-// a read waits for its data token beyond its first millisecond; never while a
-// command, its response or data bytes are transferred. It is called as follow:
+// after poweron and the 40 ms before each poll of the initialization, while
+// a read waits for a data token beyond its first millisecond, and while a
+// multiple block write waits for the end of the busy state of a data block
+// beyond its first millisecond; never while a command, its response or data
+// bytes are transferred. It is called as follow:
 // - With preemption enabled, every byte waited for being written.
 // - Its argument cnt, from 1 to bufsz, is the receive buffer usage waited for,
 //   which is reached without further action from the driver, within about 10 ms
@@ -93,8 +112,9 @@ typedef struct hwdrvsdspi {
 //   the busy state 100 us at most, and windows waiting for a data token 516
 //   bytes at most.
 // - The transmission is closed, and ends by itself, except while a read waits
-//   for its data token, where the transmission is open, and pauses once cnt
-//   is reached.
+//   for a data token, or a multiple block write for the end of the busy state
+//   of a data block, where the transmission is open, and pauses once cnt is
+//   reached.
 // The function may return early, the driver checking again; it must return
 // promptly once cnt is reached, and in any case within a bound above the longest
 // wait, such that the bound plus SCHEDLRHZ remains below PAUSETIMEOUT, ie: 20 ms.
@@ -122,15 +142,19 @@ typedef struct hwdrvsdspi {
 // Recoverable failures are a response R1 reporting an error, a data error token,
 // a CRC16 mismatch of the data read when HWDRVSDSPI_CRC is non-null, and a data
 // response rejecting the data written, the busy state which follows it being
-// awaited.
+// awaited; a multiple block read is then ended by CMD12, a multiple block write
+// by the Stop Tran token.
 // Fatal failures set dev->blkcnt null: no response R1 within the NCR (Command
 // Response Time), 8 bytes at most, a response R1 reporting the idle state to a
 // read or a write (the card was reset), no data token within the NAC (Data Read
-// Access Time), 100 ms at most, no valid data response, a busy state lasting
+// Access Time), 100 ms at most for each data block, no response to the CMD12
+// ending a multiple block read, no valid data response, a busy state lasting
 // more than 500 ms, and a transmission aborted by the device, other than a poll
-// of the busy state or clock cycles sent with "cs" high. Those timeouts are
-// counted in bytes clocked at dev->bitrate, hence pauses, and a dev->wait slow
-// to return, only lengthen them in time.
+// of the busy state or clock cycles sent with "cs" high. A multiple block read
+// failing as fatal once its CMD18 was sent sends CMD12 again as a transmission
+// of its own, whose outcome is ignored, so that the card does not remain sending
+// data blocks. Those timeouts are counted in bytes clocked at dev->bitrate, hence
+// pauses, and a dev->wait slow to return, only lengthen them in time.
 // While dev->blkcnt is null, ie: the initialization failed, the card stopped
 // answering, or a transmission was aborted, hwdrvsdspi_read() and
 // hwdrvsdspi_write() fail without accessing the device, until hwdrvsdspi_init()
@@ -522,175 +546,6 @@ static intptr_t __hwdrvsdspi_cmd (hwdrvsdspi_t *dev, __hwdrvsdspi_xmit_t *x,
 	return -1;
 }
 
-// Send the command i with the argument a, and receive the data block of L bytes
-// which follows, as a single transmission: the command as for __hwdrvsdspi_cmd(),
-// R1 from the byte 10 to 18, the data token after the NAC (Data Read Access
-// Time), up to 100 ms of bytes 0xff, the data block, its CRC16, and a byte
-// giving the card 8 clock cycles.
-// Until the data token, (L+4) bytes 0xff at most are written ahead of the bytes
-// read, refilled once half of them are read, or, beyond the first millisecond
-// waiting for the data token, once all of them are read, then waited for using
-// dev->wait; then, the exact remainder of the transmission is written, and it
-// is closed. The data block is copied to dst when non-null; its CRC16 is
-// checked when chk is non-null, which requires dst non-null. R1 is stored at
-// r1, 0xff meaning none.
-// Return 1 on success; 0 on a recoverable failure: R1 reporting an error, a data
-// error token, or a CRC16 mismatch; -1 on a fatal failure: no R1, R1 reporting
-// the idle state, no data token within 100 ms, or the transmission aborted.
-static intptr_t __hwdrvsdspi_datain (hwdrvsdspi_t *dev, __hwdrvsdspi_xmit_t *x, uintptr_t i,
-	uintptr_t a, unsigned char *dst, uintptr_t L, uintptr_t chk, uintptr_t *r1) {
-	hwdrvchar_t *c = dev->addr;
-	unsigned char *bb = (unsigned char *)x->bb;
-	uintptr_t win = (L + 4);
-	// Once R1 is received, the index of the byte which follows it, the first of
-	// the NAC (Data Read Access Time), the bytes 0xff which precede the data token.
-	uintptr_t nac = 0;
-	uintptr_t k0, m, q, p;
-	intptr_t ret = -1;
-	*r1 = 0xff;
-	__hwdrvsdspi_open(c, x);
-	__hwdrvsdspi_stage(x, i, a, 10);
-	__hwdrvsdspi_put(c, x, bb, 10);
-	__hwdrvsdspi_fill(c, x, win);
-	for (;;) {
-		uintptr_t e = __hwdrvsdspi_idle(c);
-		k0 = x->r; // Index of the first byte read below.
-		if (!(m = __hwdrvsdspi_take(c, x, bb, sizeof(x->bb)))) {
-			if (e) // Idle while open: the transmission was aborted.
-				goto end;
-			if (nac && (x->r - nac) >= (dev->bitrate/8000) && dev->wait) {
-				// Beyond the first millisecond waiting for the data token,
-				// wait for a window of bytes at a time, the transmission
-				// pausing at its end; a pause is legal, as is a preemption
-				// while spinning otherwise.
-				__hwdrvsdspi_fill(c, x, (win - (x->w - x->r)));
-				dev->wait(dev, (x->w - x->r));
-			}
-			continue;
-		}
-		q = 0;
-		if (!nac) {
-			// R1 is the first byte whose most significant bit is null
-			// from the byte 10 to 18; a card reporting the idle state
-			// was reset.
-			for (; q < m; ++q) {
-				uintptr_t k = (k0 + q);
-				if (k < 10)
-					continue;
-				uintptr_t b = bb[q];
-				if (!(b & 0x80)) {
-					*r1 = b;
-					if (b & 0x01)
-						goto end;
-					if (b & 0x7e) {
-						ret = 0;
-						goto end;
-					}
-					nac = ++k;
-					++q;
-					break;
-				}
-				if (k == 18) // No R1.
-					goto end;
-			}
-		}
-		if (nac) {
-			// Bytes 0xff are skipped, a word at a time when every byte of
-			// an aligned word is 0xff; 0xfe is the data token, and any other
-			// byte is a data error token.
-			for (; q < m; ++q) {
-				if (!(q % sizeof(uintptr_t)) && (q + sizeof(uintptr_t)) <= m &&
-					x->bb[q/sizeof(uintptr_t)] == (uintptr_t)-1) {
-					q += (sizeof(uintptr_t) - 1);
-					continue;
-				}
-				uintptr_t b = bb[q];
-				if (b == 0xff)
-					continue;
-				if (b == 0xfe) {
-					p = (k0 + q);
-					goto token;
-				}
-				// A data error token; the bytes written ahead may all have
-				// been read, hence a byte is added if needed, giving the card
-				// 8 clock cycles after the data error token.
-				if (x->w < (k0 + q + 2))
-					__hwdrvsdspi_fill(c, x, ((k0 + q + 2) - x->w));
-				ret = 0;
-				goto end;
-			}
-			if ((x->r - nac) > (dev->bitrate/80)) // No data token within 100 ms.
-				goto end;
-		}
-		// Beyond the first millisecond waiting for the data token, the window
-		// is not refilled at its half: it is read whole, then refilled whole
-		// above, where dev->wait is called; otherwise, at the highest bitrates,
-		// a byte being received during every iteration, the receive buffer
-		// would never be found empty, and dev->wait never called.
-		if ((x->w - x->r) <= (win/2) && !(nac && dev->wait && (x->r - nac) >= (dev->bitrate/8000)))
-			__hwdrvsdspi_fill(c, x, (win - (x->w - x->r)));
-	}
-token:
-	// The remainder is never negative: the count of bytes written is at most
-	// (10+win), or the count of bytes read before a refill plus win, hence at
-	// most the greatest of (10+win) and (k0+win), whereas p is at least 11 and k0.
-	__hwdrvsdspi_fill(c, x, ((p + L + 4) - x->w));
-	__hwdrvsdspi_close(c);
-	{
-		// Bytes are taken as they are received, without sleeping, which
-		// would serialize receiving and reading them.
-		uintptr_t o = 0; // Count of bytes of the data block received.
-		uintptr_t t = 0; // Count of bytes received after the data block.
-		uintptr_t crc = 0, cb = 0;
-		for (++q; q < m; ++q) {
-			if (o < L) {
-				if (dst)
-					dst[o] = bb[q];
-				++o;
-			} else {
-				cb = ((cb << 8) | bb[q]);
-				++t;
-			}
-		}
-		if (chk)
-			crc = __hwdrvsdspi_crc16(0, dst, o);
-		for (;;) {
-			uintptr_t e = __hwdrvsdspi_idle(c), k;
-			if (o < L) {
-				unsigned char *d = (dst ? &dst[o] : bb);
-				k = (L - o);
-				if (!dst && k > sizeof(x->bb))
-					k = sizeof(x->bb);
-				if ((k = __hwdrvsdspi_take(c, x, d, k))) {
-					if (chk)
-						crc = __hwdrvsdspi_crc16(crc, d, k);
-					o += k;
-					continue;
-				}
-			} else if (t < 3) {
-				// The CRC16, then the byte which follows it.
-				if ((k = __hwdrvsdspi_take(c, x, bb, (3 - t)))) {
-					for (q = 0; q < k; ++q, ++t)
-						cb = ((cb << 8) | bb[q]);
-					continue;
-				}
-			} else
-				break;
-			if (e) // Idle with bytes missing: the transmission was aborted.
-				break;
-		}
-		if (!__hwdrvsdspi_drain(c, x))
-			return -1;
-		return (!chk || crc == ((cb >> 8) & 0xffff));
-	}
-end:
-	// Once closed, the transmission ends after the bytes 0xff written ahead.
-	__hwdrvsdspi_close(c);
-	if (!__hwdrvsdspi_drain(c, x))
-		ret = -1;
-	return ret;
-}
-
 // Wait until the card is no longer busy, polling it using transmissions of
 // k bytes 0xff, the first being the control byte, k doubling from 1 up to about
 // 100 us of bytes; those transmissions being closed, "cs" rising between them,
@@ -750,6 +605,323 @@ static void __hwdrvsdspi_clocks (hwdrvsdspi_t *dev, __hwdrvsdspi_xmit_t *x, uint
 		n -= k;
 	}
 	__hwdrvsdspi_close(c); // Disable interrupt, which dev->wait may have enabled.
+}
+
+// Write CMD12 (STOP_TRANSMISSION), which ends the CMD18 in progress, then 12
+// bytes 0xff: its stuff byte, the 9 bytes of the window of its response R1b,
+// NCR being 0 to 8 bytes after the stuff byte, a byte, and a byte checking the
+// busy state. Return the index of its first byte.
+static uintptr_t __hwdrvsdspi_putstop12 (hwdrvchar_t *c, __hwdrvsdspi_xmit_t *x) {
+	unsigned char *bb = (unsigned char *)x->bb;
+	uintptr_t s = x->w;
+	__hwdrvsdspi_stage(x, 12, 0, 22);
+	__hwdrvsdspi_put(c, x, &bb[4], 18);
+	return s;
+}
+
+// Send CMD12 (STOP_TRANSMISSION) alone, as a transmission of 22 bytes, whose
+// outcome is ignored: it stops a card which a fatal failure left sending the
+// data blocks of a CMD18, and is illegal otherwise, which is harmless; its busy
+// state is left to the next hwdrvsdspi_init(). Interrupt is left disabled.
+static void __hwdrvsdspi_stopread (hwdrvsdspi_t *dev, __hwdrvsdspi_xmit_t *x) {
+	hwdrvchar_t *c = dev->addr;
+	unsigned char *bb = (unsigned char *)x->bb;
+	__hwdrvsdspi_open(c, x);
+	__hwdrvsdspi_stage(x, 12, 0, 22);
+	__hwdrvsdspi_put(c, x, bb, 22);
+	__hwdrvsdspi_close(c);
+	__hwdrvsdspi_drain(c, x);
+}
+
+// Send the command i with the argument a, and receive the cnt data blocks of L
+// bytes which follow, as a single transmission: the command as for
+// __hwdrvsdspi_cmd(), R1 from the byte 10 to 18, then per data block, the data
+// token after the NAC (Data Read Access Time), up to 100 ms of bytes 0xff, the
+// data block and its CRC16. A count of 1 ends with a byte giving the card 8
+// clock cycles. A greater count, only used with CMD18, ends with CMD12 right
+// after the CRC16 of the last data block, as __hwdrvsdspi_putstop12() writes it:
+// the data blocks which the card may begin meanwhile are ignored, and so is its
+// stuff byte; its response is awaited, not decoded, since a response shifted by
+// a few bits could not be told from an error, which anyway does not concern the
+// data blocks received; its busy state is awaited, the transmission closed.
+// Until each data token, (L+4) bytes 0xff at most are written ahead of the bytes
+// read, refilled once half of them are read, or, beyond the first millisecond
+// waiting for that data token, once all of them are read, then waited for using
+// dev->wait; then, the remainder of the data block through its CRC16 is written,
+// the rest of the transmission after the last one, and it is closed. The bytes
+// 0xff which await the data token of the next data block are written once the
+// data block is read and its CRC16 checked, the transmission pausing meanwhile,
+// which is legal: the card's delay between two data blocks elapses during the
+// CRC16 instead of being clocked. The indexes of the bytes are rebased at each
+// data block, so that none grows with the count of data blocks.
+// The data blocks are copied one after the other from dst when non-null; their
+// CRC16 is checked when chk is non-null, which requires dst non-null. R1 is
+// stored at r1, 0xff meaning none, and the count of data blocks received, and
+// checked when chk is non-null, from the first, at got.
+// Return 1 on success; 0 on a recoverable failure: R1 reporting an error, a data
+// error token, or a CRC16 mismatch; -1 on a fatal failure: no R1, R1 reporting
+// the idle state, no data token within 100 ms, no response to CMD12, its busy
+// state lasting more than 500 ms, or the transmission aborted, CMD12 being then
+// sent again as a transmission of its own, as __hwdrvsdspi_stopread() does, when
+// the count is greater than 1.
+static intptr_t __hwdrvsdspi_datain (hwdrvsdspi_t *dev, __hwdrvsdspi_xmit_t *x, uintptr_t i,
+	uintptr_t a, unsigned char *dst, uintptr_t L, uintptr_t cnt, uintptr_t chk,
+	uintptr_t *r1, uintptr_t *got) {
+	hwdrvchar_t *c = dev->addr;
+	unsigned char *bb = (unsigned char *)x->bb;
+	uintptr_t win = (L + 4);
+	// Once R1 is received, rok is non-null, and nac is the index of the first
+	// byte of the NAC (Data Read Access Time) of the data block awaited, the
+	// bytes 0xff which precede its data token.
+	uintptr_t rok = 0, nac = 0;
+	uintptr_t k0, m, q, p, s = 0;
+	intptr_t ret = -1;
+	*r1 = 0xff;
+	*got = 0;
+	__hwdrvsdspi_open(c, x);
+	__hwdrvsdspi_stage(x, i, a, 10);
+	__hwdrvsdspi_put(c, x, bb, 10);
+	__hwdrvsdspi_fill(c, x, win);
+await:
+	for (;;) {
+		uintptr_t e = __hwdrvsdspi_idle(c);
+		k0 = x->r; // Index of the first byte read below.
+		if (!(m = __hwdrvsdspi_take(c, x, bb, sizeof(x->bb)))) {
+			if (e) // Idle while open: the transmission was aborted.
+				goto aborted;
+			if (rok && (x->r - nac) >= (dev->bitrate/8000) && dev->wait) {
+				// Beyond the first millisecond waiting for the data token,
+				// wait for a window of bytes at a time, the transmission
+				// pausing at its end; a pause is legal, as is a preemption
+				// while spinning otherwise.
+				__hwdrvsdspi_fill(c, x, (win - (x->w - x->r)));
+				dev->wait(dev, (x->w - x->r));
+			}
+			continue;
+		}
+		q = 0;
+		if (!rok) {
+			// R1 is the first byte whose most significant bit is null
+			// from the byte 10 to 18; a card reporting the idle state
+			// was reset.
+			for (; q < m; ++q) {
+				uintptr_t k = (k0 + q);
+				if (k < 10)
+					continue;
+				uintptr_t b = bb[q];
+				if (!(b & 0x80)) {
+					*r1 = b;
+					if (b & 0x01)
+						goto end;
+					if (b & 0x7e) {
+						ret = 0;
+						goto end;
+					}
+					rok = 1;
+					nac = ++k;
+					++q;
+					break;
+				}
+				if (k == 18) // No R1.
+					goto end;
+			}
+		}
+		if (rok) {
+			// Bytes 0xff are skipped, a word at a time when every byte of
+			// an aligned word is 0xff; 0xfe is the data token, and any other
+			// byte is a data error token.
+			for (; q < m; ++q) {
+				if (!(q % sizeof(uintptr_t)) && (q + sizeof(uintptr_t)) <= m &&
+					x->bb[q/sizeof(uintptr_t)] == (uintptr_t)-1) {
+					q += (sizeof(uintptr_t) - 1);
+					continue;
+				}
+				uintptr_t b = bb[q];
+				if (b == 0xff)
+					continue;
+				if (b == 0xfe) {
+					p = (k0 + q);
+					goto token;
+				}
+				// A data error token; the bytes written ahead may all have
+				// been read, hence a byte is added if needed, giving the card
+				// 8 clock cycles after the data error token.
+				if (x->w < (k0 + q + 2))
+					__hwdrvsdspi_fill(c, x, ((k0 + q + 2) - x->w));
+				ret = 0;
+				goto stop;
+			}
+			if ((x->r - nac) > (dev->bitrate/80)) // No data token within 100 ms.
+				goto stop;
+		}
+		// Beyond the first millisecond waiting for the data token, the window
+		// is not refilled at its half: it is read whole, then refilled whole
+		// above, where dev->wait is called; otherwise, at the highest bitrates,
+		// a byte being received during every iteration, the receive buffer
+		// would never be found empty, and dev->wait never called.
+		if ((x->w - x->r) <= (win/2) && !(rok && dev->wait && (x->r - nac) >= (dev->bitrate/8000)))
+			__hwdrvsdspi_fill(c, x, (win - (x->w - x->r)));
+	}
+token:
+	if (cnt == 1) {
+		// The remainder is never negative: the count of bytes written is at most
+		// (10+win), or the count of bytes read before a refill plus win, hence at
+		// most the greatest of (10+win) and (k0+win), whereas p is at least 11 and k0.
+		__hwdrvsdspi_fill(c, x, ((p + L + 4) - x->w));
+		__hwdrvsdspi_close(c);
+	} else {
+		// The data block through its CRC16; as above, at most (p+L+4) bytes are
+		// written, hence a byte beyond the CRC16 may be written already, which
+		// belongs to the NAC of the next data block.
+		if (x->w < (p + L + 3))
+			__hwdrvsdspi_fill(c, x, ((p + L + 3) - x->w));
+	}
+	{
+		// Bytes are taken as they are received, without sleeping, which
+		// would serialize receiving and reading them; a data block of a count
+		// greater than 1 is taken through its CRC16, the chunk taken above
+		// never going beyond it since it holds 64 bytes at most, less than
+		// (L+3) for CMD18.
+		uintptr_t o = 0; // Count of bytes of the data block received.
+		uintptr_t t = 0; // Count of bytes received after the data block.
+		uintptr_t n = ((cnt == 1) ? 3 : 2); // Count of bytes taken after the data block.
+		uintptr_t crc = 0, cb = 0;
+		for (++q; q < m; ++q) {
+			if (o < L) {
+				if (dst)
+					dst[o] = bb[q];
+				++o;
+			} else {
+				cb = ((cb << 8) | bb[q]);
+				++t;
+			}
+		}
+		if (cnt > 1 && (*got + 1) == cnt) {
+			// The last data block: CMD12 follows its CRC16, the bytes beyond it
+			// being at most (p+L+4), then the transmission is closed.
+			s = __hwdrvsdspi_putstop12(c, x);
+			__hwdrvsdspi_close(c);
+		}
+		if (chk)
+			crc = __hwdrvsdspi_crc16(0, dst, o);
+		for (;;) {
+			uintptr_t e = __hwdrvsdspi_idle(c), k;
+			if (o < L) {
+				unsigned char *d = (dst ? &dst[o] : bb);
+				k = (L - o);
+				if (!dst && k > sizeof(x->bb))
+					k = sizeof(x->bb);
+				if ((k = __hwdrvsdspi_take(c, x, d, k))) {
+					if (chk)
+						crc = __hwdrvsdspi_crc16(crc, d, k);
+					o += k;
+					continue;
+				}
+			} else if (t < n) {
+				// The CRC16, then, for a count of 1, the byte which follows it.
+				if ((k = __hwdrvsdspi_take(c, x, bb, (n - t)))) {
+					for (q = 0; q < k; ++q, ++t)
+						cb = ((cb << 8) | bb[q]);
+					continue;
+				}
+			} else
+				break;
+			if (e) // Idle with bytes missing: the transmission was aborted.
+				break;
+		}
+		if (cnt == 1) {
+			if (!__hwdrvsdspi_drain(c, x))
+				return -1;
+			return (!chk || crc == ((cb >> 8) & 0xffff));
+		}
+		if (o < L || t < n)
+			goto aborted;
+		if (chk && crc != (cb & 0xffff)) {
+			// A CRC16 mismatch: the data blocks before it are counted,
+			// and CMD12 follows, written already after the last data block.
+			ret = 0;
+			if ((*got + 1) == cnt)
+				goto tail;
+			goto stop;
+		}
+		if (++*got == cnt) {
+			ret = 1;
+			goto tail;
+		}
+		// The next data block: every byte through the CRC16 was read, from
+		// which the indexes are rebased, the NAC beginning at 0 with the byte
+		// which may have been written beyond the CRC16; the late window.
+		dst += L;
+		x->w -= x->r;
+		x->r = 0;
+		nac = 0;
+		if (x->w < win)
+			__hwdrvsdspi_fill(c, x, (win - x->w));
+		goto await;
+	}
+stop:
+	// A data error token, a CRC16 mismatch of a data block before the last,
+	// or no data token within 100 ms (ret -1); with a count of 1, the
+	// transmission ends after the bytes 0xff written ahead, otherwise CMD12
+	// follows them.
+	if (cnt == 1)
+		goto end;
+	s = __hwdrvsdspi_putstop12(c, x);
+	__hwdrvsdspi_close(c);
+tail:
+	{
+		// The transmission of a count greater than 1, closed, with CMD12 at s:
+		// its response is the first byte other than 0xff from s+7 to s+15, the
+		// byte s+6 being its stuff byte, and the byte s+17 is busy while the
+		// card is. Every byte written before s is read and ignored.
+		uintptr_t ans = 0, v = 0xff;
+		for (;;) {
+			uintptr_t e = __hwdrvsdspi_idle(c);
+			k0 = x->r;
+			if (!(m = __hwdrvsdspi_take(c, x, bb, sizeof(x->bb)))) {
+				if (e)
+					break;
+				continue;
+			}
+			for (q = 0; q < m; ++q) {
+				uintptr_t k = (k0 + q);
+				if (k >= (s + 7) && k <= (s + 15) && bb[q] != 0xff)
+					ans = 1;
+				else if (k == (s + 17))
+					v = bb[q];
+			}
+		}
+		if (x->r != x->w || !ans) {
+			// Aborted, or no response to CMD12: the card may still be
+			// sending data blocks.
+			__hwdrvsdspi_stopread(dev, x);
+			return -1;
+		}
+		// The busy state of the response R1b, if any.
+		if (v != 0xff && !__hwdrvsdspi_busy(dev, x))
+			return -1;
+		return ret;
+	}
+aborted:
+	// The transmission was aborted: idle while open, or with bytes missing.
+	// With a count greater than 1, the card may still be sending data blocks,
+	// once the command reached it.
+	if (cnt == 1)
+		goto end;
+	__hwdrvsdspi_close(c);
+	__hwdrvsdspi_drain(c, x);
+	__hwdrvsdspi_stopread(dev, x);
+	return -1;
+end:
+	// Once closed, the transmission ends after the bytes 0xff written ahead. With
+	// a count greater than 1, a fatal failure, ie: no R1 or R1 reporting the idle
+	// state, also sends CMD12 alone, in case the card began sending data blocks.
+	__hwdrvsdspi_close(c);
+	if (!__hwdrvsdspi_drain(c, x))
+		ret = -1;
+	if (cnt > 1 && ret < 0)
+		__hwdrvsdspi_stopread(dev, x);
+	return ret;
 }
 
 // Return the capacity in block count, computed from the CSD register:
@@ -878,12 +1050,12 @@ static uintptr_t hwdrvsdspi_init (hwdrvsdspi_t *dev) {
 	// an error, ie: illegal before SD 1.10, skips it, whereas a data error token
 	// fails. The 64 bytes of the switch status are ignored.
 	if (!(dev->flags & HWDRVSDSPI_FLAG_MMC)) {
-		r = __hwdrvsdspi_datain(dev, &x, 6, 0x80fffff1, 0, 64, 0, &r1);
+		r = __hwdrvsdspi_datain(dev, &x, 6, 0x80fffff1, 0, 64, 1, 0, &r1, &n);
 		if (r < 0 || (!r && !(r1 & 0x7e)))
 			return 0;
 	}
 	// CMD9, the CSD register, its CRC16 checked when HWDRVSDSPI_CRC is non-null.
-	if (__hwdrvsdspi_datain(dev, &x, 9, 0, dev->csd, 16, HWDRVSDSPI_CRC, &r1) != 1)
+	if (__hwdrvsdspi_datain(dev, &x, 9, 0, dev->csd, 16, 1, HWDRVSDSPI_CRC, &r1, &n) != 1)
 		return 0;
 	// CMD58, the OCR register, whose bit 30 is set if the card is block addressed.
 	r = __hwdrvsdspi_cmd(dev, &x, 58, 0, r4);
@@ -909,17 +1081,13 @@ static uintptr_t hwdrvsdspi_init (hwdrvsdspi_t *dev) {
 	return 1;
 }
 
-// Read a block from the sdspi device into the buffer given by the argument ptr.
-// The index of the block to read is given by the argument idx,
-// where a block is HWDRVSDSPI_BLKSZ bytes.
-// Returns 1 if block was read, otherwise 0.
-static uintptr_t hwdrvsdspi_read (hwdrvsdspi_t *dev, void* ptr, uintptr_t idx) {
-	if (idx >= dev->blkcnt)
-		return 0;
-	__hwdrvsdspi_xmit_t x;
-	uintptr_t r1;
-	intptr_t r = __hwdrvsdspi_datain(dev, &x, 17,
-		((dev->flags & HWDRVSDSPI_FLAG_BLKADDR) ? idx : (idx << 9)), ptr, HWDRVSDSPI_BLKSZ, HWDRVSDSPI_CRC, &r1);
+// Read the block of index idx into the buffer ptr, using READ_SINGLE_BLOCK
+// (CMD17); return 1 if the block was read, otherwise 0.
+static uintptr_t __hwdrvsdspi_read1 (hwdrvsdspi_t *dev, __hwdrvsdspi_xmit_t *x,
+	unsigned char *ptr, uintptr_t idx) {
+	uintptr_t r1, got;
+	intptr_t r = __hwdrvsdspi_datain(dev, x, 17,
+		((dev->flags & HWDRVSDSPI_FLAG_BLKADDR) ? idx : (idx << 9)), ptr, HWDRVSDSPI_BLKSZ, 1, HWDRVSDSPI_CRC, &r1, &got);
 	if (r < 0) { // Fatal; the transmission is closed and has ended.
 		dev->blkcnt = 0;
 		return 0;
@@ -927,16 +1095,12 @@ static uintptr_t hwdrvsdspi_read (hwdrvsdspi_t *dev, void* ptr, uintptr_t idx) {
 	return r;
 }
 
-// Write a block to the sdspi device from the buffer given by the argument ptr.
-// The index of the block to write is given by the argument idx,
-// where a block is HWDRVSDSPI_BLKSZ bytes.
-// Returns 1 if block was written, otherwise 0.
-static uintptr_t hwdrvsdspi_write (hwdrvsdspi_t *dev, void* ptr, uintptr_t idx) {
-	if (idx >= dev->blkcnt)
-		return 0;
+// Write the block of index idx from the buffer ptr, using WRITE_BLOCK (CMD24);
+// return 1 if the block was written, otherwise 0.
+static uintptr_t __hwdrvsdspi_write1 (hwdrvsdspi_t *dev, __hwdrvsdspi_xmit_t *x,
+	unsigned char *ptr, uintptr_t idx) {
 	hwdrvchar_t *c = dev->addr;
-	__hwdrvsdspi_xmit_t x;
-	unsigned char *bb = (unsigned char *)x.bb;
+	unsigned char *bb = (unsigned char *)x->bb;
 	// The CRC16 is computed before the transmission, bringing ptr in the data cache;
 	// when HWDRVSDSPI_CRC is null, bytes 0xff are sent in its place, which the card
 	// ignores.
@@ -944,15 +1108,15 @@ static uintptr_t hwdrvsdspi_write (hwdrvsdspi_t *dev, void* ptr, uintptr_t idx) 
 	uintptr_t r1 = 0x100, dr = 0x100, v = 0, k0, m, q; // 0x100 meaning none yet.
 	// The command and the window of its response R1, the NCR (Command Response
 	// Time), the transmission left open, pausing while R1 gets checked.
-	__hwdrvsdspi_open(c, &x);
-	__hwdrvsdspi_stage(&x, 24, ((dev->flags & HWDRVSDSPI_FLAG_BLKADDR) ? idx : (idx << 9)), 19);
-	__hwdrvsdspi_put(c, &x, bb, 19);
+	__hwdrvsdspi_open(c, x);
+	__hwdrvsdspi_stage(x, 24, ((dev->flags & HWDRVSDSPI_FLAG_BLKADDR) ? idx : (idx << 9)), 19);
+	__hwdrvsdspi_put(c, x, bb, 19);
 	while (r1 > 0xff) {
 		uintptr_t e = __hwdrvsdspi_idle(c);
-		k0 = x.r;
-		if (!(m = __hwdrvsdspi_take(c, &x, bb, sizeof(x.bb)))) {
+		k0 = x->r;
+		if (!(m = __hwdrvsdspi_take(c, x, bb, sizeof(x->bb)))) {
 			if (e) // Idle while open: the transmission was aborted.
-				return __hwdrvsdspi_fatal(dev, &x);
+				return __hwdrvsdspi_fatal(dev, x);
 			continue;
 		}
 		for (q = 0; q < m; ++q) {
@@ -961,17 +1125,17 @@ static uintptr_t hwdrvsdspi_write (hwdrvsdspi_t *dev, void* ptr, uintptr_t idx) 
 				break;
 			}
 		}
-		if (r1 > 0xff && x.r == x.w) // No R1.
-			return __hwdrvsdspi_fatal(dev, &x);
+		if (r1 > 0xff && x->r == x->w) // No R1.
+			return __hwdrvsdspi_fatal(dev, x);
 	}
 	if (r1) {
 		// Rejected, the data block is not sent; a byte gives the card
 		// 8 clock cycles after R1. A card reporting the idle state was reset.
-		__hwdrvsdspi_put(c, &x, __hwdrvsdspi_ff, 1);
+		__hwdrvsdspi_put(c, x, __hwdrvsdspi_ff, 1);
 		if (r1 & 0x01)
-			return __hwdrvsdspi_fatal(dev, &x);
+			return __hwdrvsdspi_fatal(dev, x);
 		__hwdrvsdspi_close(c);
-		if (!__hwdrvsdspi_drain(c, &x))
+		if (!__hwdrvsdspi_drain(c, x))
 			dev->blkcnt = 0;
 		return 0;
 	}
@@ -981,18 +1145,18 @@ static uintptr_t hwdrvsdspi_write (hwdrvsdspi_t *dev, void* ptr, uintptr_t idx) 
 	// last byte (544) is busy if the card is.
 	bb[0] = 0xff;
 	bb[1] = 0xfe;
-	__hwdrvsdspi_put(c, &x, bb, 2);
-	__hwdrvsdspi_put(c, &x, ptr, HWDRVSDSPI_BLKSZ);
+	__hwdrvsdspi_put(c, x, bb, 2);
+	__hwdrvsdspi_put(c, x, ptr, HWDRVSDSPI_BLKSZ);
 	bb[0] = (crc >> 8);
 	bb[1] = crc;
 	for (q = 2; q < 12; ++q)
 		bb[q] = 0xff;
-	__hwdrvsdspi_put(c, &x, bb, 12);
+	__hwdrvsdspi_put(c, x, bb, 12);
 	__hwdrvsdspi_close(c);
 	for (;;) {
 		uintptr_t e = __hwdrvsdspi_idle(c);
-		k0 = x.r;
-		if (!(m = __hwdrvsdspi_take(c, &x, bb, sizeof(x.bb)))) {
+		k0 = x->r;
+		if (!(m = __hwdrvsdspi_take(c, x, bb, sizeof(x->bb)))) {
 			if (e)
 				break;
 			continue;
@@ -1005,18 +1169,258 @@ static uintptr_t hwdrvsdspi_write (hwdrvsdspi_t *dev, void* ptr, uintptr_t idx) 
 				v = bb[q];
 		}
 	}
-	if (!__hwdrvsdspi_drain(c, &x))
-		return __hwdrvsdspi_fatal(dev, &x);
+	if (!__hwdrvsdspi_drain(c, x))
+		return __hwdrvsdspi_fatal(dev, x);
 	// The busy state is awaited whether the data was accepted or not, and even
 	// without a valid data response, since the initialization which a fatal
 	// failure requires begins with CMD0, which would end a write in progress.
-	if (v != 0xff && !__hwdrvsdspi_busy(dev, &x))
-		return __hwdrvsdspi_fatal(dev, &x);
+	if (v != 0xff && !__hwdrvsdspi_busy(dev, x))
+		return __hwdrvsdspi_fatal(dev, x);
 	// A data response is xxx0sss1: none, or a byte not of that form, ie: a busy
 	// state instead, is fatal; sss is 010 when the data was accepted.
 	if (dr > 0xff || (dr & 0x11) != 0x01)
-		return __hwdrvsdspi_fatal(dev, &x);
+		return __hwdrvsdspi_fatal(dev, x);
 	return ((dr & 0x0e) == 0x04);
+}
+
+// Wait until the card is no longer busy after a data block of a multiple block
+// write, within its transmission, "cs" remaining low: windows of k bytes 0xff,
+// each read whole, until one ends with a byte 0xff, the card driving its output
+// low while busy. A window overshooting the end of the busy state by up to its
+// size, k doubles from 8 up to 64 bytes through the first millisecond of those
+// bytes, while the driver spins, then up to about 100 us of bytes, dev->wait
+// being called for each window, the transmission pausing at its end. Return
+// null if the card is still busy after 500 ms of clocked bytes, or if the
+// transmission was aborted.
+static uintptr_t __hwdrvsdspi_inbusy (hwdrvsdspi_t *dev, __hwdrvsdspi_xmit_t *x) {
+	hwdrvchar_t *c = dev->addr;
+	unsigned char *bb = (unsigned char *)x->bb;
+	uintptr_t budget = (dev->bitrate/16), cap = (dev->bitrate/80000), k = 8, n = 0, v = 0;
+	if (cap > c->bufsz)
+		cap = c->bufsz;
+	if (!cap)
+		cap = 1;
+	while (budget) {
+		if (k > cap)
+			k = cap;
+		if (n < (dev->bitrate/8000) && k > 64)
+			k = 64;
+		if (k > budget)
+			k = budget;
+		__hwdrvsdspi_fill(c, x, k);
+		if (n >= (dev->bitrate/8000) && dev->wait)
+			dev->wait(dev, (x->w - x->r));
+		while (x->r != x->w) {
+			uintptr_t e = __hwdrvsdspi_idle(c), m;
+			if ((m = __hwdrvsdspi_take(c, x, bb, sizeof(x->bb))))
+				v = bb[m-1];
+			else if (e) // Idle with bytes missing: the transmission was aborted.
+				return 0;
+		}
+		budget -= k;
+		n += k;
+		if (v == 0xff)
+			return 1;
+		k *= 2;
+	}
+	return 0;
+}
+
+// Write the cnt data blocks at ptr, cnt being at least 2, from the address a,
+// using WRITE_MULTIPLE_BLOCK (CMD25), as a single transmission: the command and
+// the window of its response R1, as for CMD24, the transmission pausing while
+// R1 gets checked, then per data block, a byte 0xff, the data token 0xfc, the
+// data block and its CRC16, the 8 bytes 0xff within which the data response is
+// expected, then 2 bytes 0xff, the last being busy if the card is, its busy
+// state being then awaited within the transmission by __hwdrvsdspi_inbusy(); the
+// CRC16 of the next data block is computed before, while the card is busy.
+// Last, a byte 0xff, the Stop Tran token 0xfd, and 2 bytes 0xff, the last being
+// busy if the card is: the busy state of the Stop Tran token is awaited by
+// __hwdrvsdspi_busy(), the transmission closed.
+// The indexes of the bytes are rebased at each data block. A data block rejected
+// by its data response ends the write the same way, its busy state awaited.
+// When HWDRVSDSPI_PREERASE is non-null, CMD55 and ACMD23 (SET_WR_BLK_ERASE_COUNT)
+// precede CMD25, each as a transmission of its own.
+// Return the count of data blocks known written, from the first: cnt on success,
+// the count of the data blocks before a data block rejected for its CRC16, none
+// after a write error, which may concern an earlier data block, and none after a
+// fatal failure, which sets dev->blkcnt null: no response R1, R1 reporting the
+// idle state, no valid data response, a busy state lasting more than 500 ms, or
+// the transmission aborted.
+static uintptr_t __hwdrvsdspi_mbwrite (hwdrvsdspi_t *dev, __hwdrvsdspi_xmit_t *x,
+	unsigned char *ptr, uintptr_t a, uintptr_t cnt) {
+	hwdrvchar_t *c = dev->addr;
+	unsigned char *bb = (unsigned char *)x->bb;
+	uintptr_t crc = (HWDRVSDSPI_CRC ? __hwdrvsdspi_crc16(0, ptr, HWDRVSDSPI_BLKSZ) : 0xffff);
+	uintptr_t r1 = 0x100, ret = cnt, k0, m, q, b; // 0x100 meaning none yet.
+	if (HWDRVSDSPI_PREERASE) {
+		// The count of data blocks to pre-erase, which ACMD23 holds in 23 bits;
+		// ACMD23 is sent only if CMD55 succeeded.
+		intptr_t r = __hwdrvsdspi_cmd(dev, x, 55, 0, 0);
+		if (!r)
+			r = __hwdrvsdspi_cmd(dev, x, 23, ((cnt > 0x7fffff) ? 0x7fffff : cnt), 0);
+		if (r < 0 || (r & 0x01)) { // No response R1, or the card was reset.
+			dev->blkcnt = 0;
+			return 0;
+		}
+		if (r) // A response R1 reporting an error: nothing is written.
+			return 0;
+	}
+	// The command and the window of its response R1, as for CMD24.
+	__hwdrvsdspi_open(c, x);
+	__hwdrvsdspi_stage(x, 25, a, 19);
+	__hwdrvsdspi_put(c, x, bb, 19);
+	while (r1 > 0xff) {
+		uintptr_t e = __hwdrvsdspi_idle(c);
+		k0 = x->r;
+		if (!(m = __hwdrvsdspi_take(c, x, bb, sizeof(x->bb)))) {
+			if (e) // Idle while open: the transmission was aborted.
+				return __hwdrvsdspi_fatal(dev, x);
+			continue;
+		}
+		for (q = 0; q < m; ++q) {
+			if ((k0 + q) >= 10 && !(bb[q] & 0x80)) {
+				r1 = bb[q];
+				break;
+			}
+		}
+		if (r1 > 0xff && x->r == x->w) // No R1.
+			return __hwdrvsdspi_fatal(dev, x);
+	}
+	if (r1) {
+		// Rejected, no data block is sent, as for CMD24.
+		__hwdrvsdspi_put(c, x, __hwdrvsdspi_ff, 1);
+		if (r1 & 0x01)
+			return __hwdrvsdspi_fatal(dev, x);
+		__hwdrvsdspi_close(c);
+		if (!__hwdrvsdspi_drain(c, x))
+			dev->blkcnt = 0;
+		return 0;
+	}
+	for (b = 0; b < cnt; ++b, ptr += HWDRVSDSPI_BLKSZ) {
+		// The indexes are rebased at the first byte not read: j is then the
+		// index of the byte 0xff before the data token, 19 less the bytes of
+		// the window of R1 read for the first data block, 0 for the others,
+		// every byte of the busy state of the previous data block being read.
+		uintptr_t j, dr = 0x100, v = 0, valid, acc;
+		x->w -= x->r;
+		x->r = 0;
+		j = x->w;
+		bb[0] = 0xff;
+		bb[1] = 0xfc;
+		__hwdrvsdspi_put(c, x, bb, 2);
+		__hwdrvsdspi_put(c, x, ptr, HWDRVSDSPI_BLKSZ);
+		bb[0] = (crc >> 8);
+		bb[1] = crc;
+		for (q = 2; q < 12; ++q)
+			bb[q] = 0xff;
+		__hwdrvsdspi_put(c, x, bb, 12);
+		// The data response is the first byte other than 0xff from (j+516) to
+		// (j+523), and the byte (j+525) is busy if the card is; every byte is
+		// taken, spinning.
+		while (x->r != x->w) {
+			uintptr_t e = __hwdrvsdspi_idle(c);
+			k0 = x->r;
+			if (!(m = __hwdrvsdspi_take(c, x, bb, sizeof(x->bb)))) {
+				if (e) // Idle while open: the transmission was aborted.
+					return __hwdrvsdspi_fatal(dev, x);
+				continue;
+			}
+			for (q = 0; q < m; ++q) {
+				uintptr_t k = (k0 + q);
+				if (k >= (j + 516) && k <= (j + 523) && dr > 0xff && bb[q] != 0xff)
+					dr = bb[q];
+				else if (k == (j + 525))
+					v = bb[q];
+			}
+		}
+		// A data response is xxx0sss1, sss being 010 when the data was accepted.
+		valid = (dr <= 0xff && (dr & 0x11) == 0x01);
+		acc = (valid && (dr & 0x0e) == 0x04);
+		// The CRC16 of the next data block, while the card is busy, the
+		// transmission pausing meanwhile.
+		if (acc && (b + 1) < cnt)
+			crc = (HWDRVSDSPI_CRC ? __hwdrvsdspi_crc16(0, (ptr + HWDRVSDSPI_BLKSZ), HWDRVSDSPI_BLKSZ) : 0xffff);
+		// The busy state is awaited whether the data was accepted or not, and
+		// even without a valid data response, as for CMD24.
+		if (v != 0xff && !__hwdrvsdspi_inbusy(dev, x))
+			return __hwdrvsdspi_fatal(dev, x);
+		if (!valid)
+			return __hwdrvsdspi_fatal(dev, x);
+		if (!acc) {
+			// Rejected: 101 for a CRC error, which concerns this data block;
+			// otherwise a write error, which may concern an earlier one.
+			ret = (((dr & 0x0e) == 0x0a) ? b : 0);
+			break;
+		}
+	}
+	// A byte 0xff, the Stop Tran token, a byte 0xff (NBR), then a byte 0xff
+	// which is busy if the card is: the busy state begins a byte after the
+	// Stop Tran token, as after a data response.
+	bb[0] = 0xff;
+	bb[1] = 0xfd;
+	bb[2] = 0xff;
+	bb[3] = 0xff;
+	__hwdrvsdspi_put(c, x, bb, 4);
+	__hwdrvsdspi_close(c);
+	if (!__hwdrvsdspi_drain(c, x))
+		return __hwdrvsdspi_fatal(dev, x);
+	if (x->v != 0xff && !__hwdrvsdspi_busy(dev, x))
+		return __hwdrvsdspi_fatal(dev, x);
+	return ret;
+}
+
+// Read cnt blocks from the sdspi device into the buffer given by the argument
+// ptr, which holds cnt*HWDRVSDSPI_BLKSZ bytes. The index of the first block to
+// read is given by the argument idx, where a block is HWDRVSDSPI_BLKSZ bytes.
+// A count of 1 uses READ_SINGLE_BLOCK (CMD17), a greater count
+// READ_MULTIPLE_BLOCK (CMD18) ended by STOP_TRANSMISSION (CMD12), unless the
+// card is MMC, which is read a block at a time.
+// Returns the count of blocks read, from the first, each at its place in ptr:
+// cnt on success, fewer on a failure, the rest of ptr being then undefined; 0
+// without accessing the device when cnt is null, when the blocks are beyond
+// the card, or while dev->blkcnt is null.
+static uintptr_t hwdrvsdspi_read (hwdrvsdspi_t *dev, void* ptr, uintptr_t idx, uintptr_t cnt) {
+	// Overflow-safe: (dev->blkcnt - cnt) does not wrap once cnt <= dev->blkcnt.
+	if (!cnt || cnt > dev->blkcnt || idx > (dev->blkcnt - cnt))
+		return 0;
+	__hwdrvsdspi_xmit_t x;
+	unsigned char *p = ptr;
+	uintptr_t r1, n;
+	if (cnt == 1 || (dev->flags & HWDRVSDSPI_FLAG_MMC)) {
+		for (n = 0; n < cnt && __hwdrvsdspi_read1(dev, &x, p, idx); ++n, ++idx, p += HWDRVSDSPI_BLKSZ);
+		return n;
+	}
+	if (__hwdrvsdspi_datain(dev, &x, 18, ((dev->flags & HWDRVSDSPI_FLAG_BLKADDR) ? idx : (idx << 9)),
+		p, HWDRVSDSPI_BLKSZ, cnt, HWDRVSDSPI_CRC, &r1, &n) < 0)
+		dev->blkcnt = 0; // Fatal; the transmission is closed and has ended.
+	return n;
+}
+
+// Write cnt blocks to the sdspi device from the buffer given by the argument
+// ptr, which holds cnt*HWDRVSDSPI_BLKSZ bytes. The index of the first block to
+// write is given by the argument idx, where a block is HWDRVSDSPI_BLKSZ bytes.
+// A count of 1 uses WRITE_BLOCK (CMD24), a greater count WRITE_MULTIPLE_BLOCK
+// (CMD25), preceded by SET_WR_BLK_ERASE_COUNT (ACMD23) when HWDRVSDSPI_PREERASE
+// is non-null, and ended by the Stop Tran token, unless the card is MMC, which
+// is written a block at a time.
+// Returns the count of blocks written, from the first, which may understate
+// them: cnt on success; after a failure, the blocks beyond the count may have
+// been written or not, or erased when HWDRVSDSPI_PREERASE is non-null, ie: a
+// block rejected for its CRC16 counts the blocks before it, whereas a write
+// error, which may concern an earlier block, and a fatal failure count none; 0
+// without accessing the device as for a read.
+static uintptr_t hwdrvsdspi_write (hwdrvsdspi_t *dev, void* ptr, uintptr_t idx, uintptr_t cnt) {
+	if (!cnt || cnt > dev->blkcnt || idx > (dev->blkcnt - cnt))
+		return 0;
+	__hwdrvsdspi_xmit_t x;
+	unsigned char *p = ptr;
+	uintptr_t n;
+	if (cnt == 1 || (dev->flags & HWDRVSDSPI_FLAG_MMC)) {
+		for (n = 0; n < cnt && __hwdrvsdspi_write1(dev, &x, p, idx); ++n, ++idx, p += HWDRVSDSPI_BLKSZ);
+		return n;
+	}
+	return __hwdrvsdspi_mbwrite(dev, &x, p, ((dev->flags & HWDRVSDSPI_FLAG_BLKADDR) ? idx : (idx << 9)), cnt);
 }
 
 #endif /* HWDRVSDSPI_H */
