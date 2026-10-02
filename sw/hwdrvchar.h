@@ -104,7 +104,7 @@ static inline uintptr_t hwdrvchar_readable (hwdrvchar_t *dev) {
 // Read from the serial device into the buffer given by the
 // argument ptr, the byte amount given by the argument sz.
 // Return the byte amount read.
-static uintptr_t hwdrvchar_read (hwdrvchar_t *dev, void *ptr, uintptr_t sz) {
+static inline uintptr_t hwdrvchar_read (hwdrvchar_t *dev, void *ptr, uintptr_t sz) {
 	void *addrDat = dev->addr;
 	uintptr_t cnt = 0;
 	while (sz) {
@@ -147,7 +147,7 @@ static inline uintptr_t hwdrvchar_writable (hwdrvchar_t *dev) {
 // Write to the serial device from the buffer given by the
 // argument ptr, the byte amount given by the argument sz.
 // Return the byte amount written.
-static uintptr_t hwdrvchar_write (hwdrvchar_t *dev, void *ptr, uintptr_t sz) {
+static inline uintptr_t hwdrvchar_write (hwdrvchar_t *dev, void *ptr, uintptr_t sz) {
 	void *addrDat = dev->addr;
 	uintptr_t cnt = 0;
 	while (sz) {
