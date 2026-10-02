@@ -165,8 +165,7 @@ typedef struct hwdrvsdspi {
 // Tables of the CRC16 of data blocks, polynomial 0x1021, sliced by 4:
 // __hwdrvsdspi_crc16tab[k][i] is the CRC16 of the byte i followed by k null
 // bytes, its two bytes swapped, as __hwdrvsdspi_crc16() keeps the CRC16.
-static const unsigned short __hwdrvsdspi_crc16tab[4][256] = {
-	{
+static const unsigned short __hwdrvsdspi_crc16tab[4][256] = {{
 		0x0000, 0x2110, 0x4220, 0x6330, 0x8440, 0xa550, 0xc660, 0xe770,
 		0x0881, 0x2991, 0x4aa1, 0x6bb1, 0x8cc1, 0xadd1, 0xcee1, 0xeff1,
 		0x3112, 0x1002, 0x7332, 0x5222, 0xb552, 0x9442, 0xf772, 0xd662,
@@ -199,8 +198,7 @@ static const unsigned short __hwdrvsdspi_crc16tab[4][256] = {
 		0x267c, 0x076c, 0x645c, 0x454c, 0xa23c, 0x832c, 0xe01c, 0xc10c,
 		0x1fef, 0x3eff, 0x5dcf, 0x7cdf, 0x9baf, 0xbabf, 0xd98f, 0xf89f,
 		0x176e, 0x367e, 0x554e, 0x745e, 0x932e, 0xb23e, 0xd10e, 0xf01e,
-	},
-	{
+	}, {
 		0x0000, 0x3133, 0x6266, 0x5355, 0xc4cc, 0xf5ff, 0xa6aa, 0x9799,
 		0xa989, 0x98ba, 0xcbef, 0xfadc, 0x6d45, 0x5c76, 0x0f23, 0x3e10,
 		0x7303, 0x4230, 0x1165, 0x2056, 0xb7cf, 0x86fc, 0xd5a9, 0xe49a,
@@ -233,8 +231,7 @@ static const unsigned short __hwdrvsdspi_crc16tab[4][256] = {
 		0x1b99, 0x2aaa, 0x79ff, 0x48cc, 0xdf55, 0xee66, 0xbd33, 0x8c00,
 		0xc113, 0xf020, 0xa375, 0x9246, 0x05df, 0x34ec, 0x67b9, 0x568a,
 		0x689a, 0x59a9, 0x0afc, 0x3bcf, 0xac56, 0x9d65, 0xce30, 0xff03,
-	},
-	{
+	}, {
 		0x0000, 0x3037, 0x606e, 0x5059, 0xc0dc, 0xf0eb, 0xa0b2, 0x9085,
 		0xa1a9, 0x919e, 0xc1c7, 0xf1f0, 0x6175, 0x5142, 0x011b, 0x312c,
 		0x6343, 0x5374, 0x032d, 0x331a, 0xa39f, 0x93a8, 0xc3f1, 0xf3c6,
@@ -267,8 +264,7 @@ static const unsigned short __hwdrvsdspi_crc16tab[4][256] = {
 		0x9009, 0xa03e, 0xf067, 0xc050, 0x50d5, 0x60e2, 0x30bb, 0x008c,
 		0x52e3, 0x62d4, 0x328d, 0x02ba, 0x923f, 0xa208, 0xf251, 0xc266,
 		0xf34a, 0xc37d, 0x9324, 0xa313, 0x3396, 0x03a1, 0x53f8, 0x63cf,
-	},
-	{
+	}, {
 		0x0000, 0xb476, 0x68ed, 0xdc9b, 0xf1ca, 0x45bc, 0x9927, 0x2d51,
 		0xc385, 0x77f3, 0xab68, 0x1f1e, 0x324f, 0x8639, 0x5aa2, 0xeed4,
 		0xa71b, 0x136d, 0xcff6, 0x7b80, 0x56d1, 0xe2a7, 0x3e3c, 0x8a4a,
@@ -1377,8 +1373,8 @@ static uintptr_t __hwdrvsdspi_mbwrite (hwdrvsdspi_t *dev, __hwdrvsdspi_xmit_t *x
 // READ_MULTIPLE_BLOCK (CMD18) ended by STOP_TRANSMISSION (CMD12), unless the
 // card is MMC, which is read a block at a time.
 // Returns the count of blocks read, from the first, each at its place in ptr:
-// cnt on success, fewer on a failure, the rest of ptr being then undefined; 0
-// without accessing the device when cnt is null, when the blocks are beyond
+// cnt on success, fewer on a failure, the rest of ptr being then undefined;
+// 0 without accessing the device when cnt is null, when the blocks are beyond
 // the card, or while dev->blkcnt is null.
 static uintptr_t hwdrvsdspi_read (hwdrvsdspi_t *dev, void* ptr, uintptr_t idx, uintptr_t cnt) {
 	// Overflow-safe: (dev->blkcnt - cnt) does not wrap once cnt <= dev->blkcnt.
@@ -1408,8 +1404,8 @@ static uintptr_t hwdrvsdspi_read (hwdrvsdspi_t *dev, void* ptr, uintptr_t idx, u
 // them: cnt on success; after a failure, the blocks beyond the count may have
 // been written or not, or erased when HWDRVSDSPI_PREERASE is non-null, ie: a
 // block rejected for its CRC16 counts the blocks before it, whereas a write
-// error, which may concern an earlier block, and a fatal failure count none; 0
-// without accessing the device as for a read.
+// error, which may concern an earlier block, and a fatal failure count none;
+// 0 without accessing the device as for a read.
 static uintptr_t hwdrvsdspi_write (hwdrvsdspi_t *dev, void* ptr, uintptr_t idx, uintptr_t cnt) {
 	if (!cnt || cnt > dev->blkcnt || idx > (dev->blkcnt - cnt))
 		return 0;
