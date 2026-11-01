@@ -14,25 +14,25 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout repository and submodules
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           submodules: true
       - name: Build project
-        working-directory: ../
         run: |
           sudo ln -snf /bin/bash /bin/sh
-          sudo mount --bind /${PWD} /opt/
-          mkdir ftpu-build
-          make USETAR=1 -C ftpu-build/ -f ../ftpu/makefile all > ftpu/build.log
-          mv ftpu-build/ftpu-toolchain.tar.xz ftpu/ftpu-toolchain-linux-x64.tar.xz
+          sudo mkdir -p /opt/ftpu
+          sudo mount --bind "${{ github.workspace }}" /opt/ftpu
+          mkdir -p "${{ github.workspace }}/../ftpu-build"
+          make USETAR=1 -C "${{ github.workspace }}/../ftpu-build/" -f "${{ github.workspace }}/makefile" all > "${{ github.workspace }}/build.log"
+          mv "${{ github.workspace }}/../ftpu-build/ftpu-toolchain.tar.xz" "${{ github.workspace }}/ftpu-toolchain-linux-x64.tar.xz"
       - name: Save build.log
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           path: build.log
           name: build.log
           if-no-files-found: error
       - name: Create Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             ftpu-toolchain-linux-x64.tar.xz

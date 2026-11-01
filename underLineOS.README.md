@@ -96,7 +96,7 @@ Lock-free atomic operations on a target memory location. All macros return the p
 **Returns** — Previous value stored at `PTR`.
 
 > [!IMPORTANT]
-> Atomic instructions do **not** participate in the cache-coherency protocol. A variable manipulated with these macros must be accessed *exclusively* through them — a plain load of an atomically-written variable (or an atomic access to a plainly-written variable) can observe a stale value. Consequently, an atomically manipulated variable located in runtime-allocated memory must also be *initialized* atomically (e.g. `_xchg(&var, 0)`); statically allocated variables are safe, as their memory starts zeroed. `_fifo_init()`, `_sem_init()` and [`_mutex_init()`](#mutex) do this for the lock fields of their objects.
+> Atomic instructions do **not** participate in the cache-coherency protocol. A variable manipulated with these macros must be accessed *exclusively* through them — a plain load of an atomically-written variable (or an atomic access to a plainly-written variable) can observe a stale value. Consequently, an atomically manipulated variable must also be *initialized* atomically (e.g. `_xchg(&var, 0)`) rather than with a plain store: an atomic access to a locally cached word writes the cached value back before its read-modify-write when it is dirty, and only invalidates it when clean, so the plain store, which sits dirty in the initializing CPU's data-cache, would overwrite an update that another CPU made in memory before the initializing CPU's first own atomic access to the variable. The boot zeroes `.bss` and copies `.data` with atomic accesses, leaving no word of either in the boot CPU's data-cache (see [Boot & memory layout](#boot--memory-layout)), so this concerns memory the boot does not initialize: runtime-allocated memory, `.noinit` and `.persistent`. `_fifo_init()`, `_sem_init()` and [`_mutex_init()`](#mutex) do this for the lock fields of their objects.
 
 ---
 
@@ -210,7 +210,7 @@ void _timer_disarm(_timer_t *t);
 All registered `_irq_t` descriptors live on a single list shared by all CPUs, so a device IRQ needs to be registered only once regardless of which CPU ends up handling it. Every registered descriptor whose number matches the acknowledged interrupt source gets its callback called.
 
 > [!IMPORTANT]
-> **Callback context** — IRQ callbacks run inside the machine-mode trap handler with IRQs disabled, under the same restrictions as timer callbacks: no TLS/newlib reliance when idle was interrupted, no `malloc()`, no blocking API calls. The IRQ number `-1` is reserved for inter-processor interrupts (IPIs) used by the scheduler.
+> **Callback context** — IRQ callbacks run inside the machine-mode trap handler with IRQs disabled, under the same restrictions as timer callbacks: no TLS/newlib reliance when idle was interrupted, no `malloc()`, no blocking API calls. The IRQ number `-1` is reserved for inter-processor interrupts (IPIs) used by the scheduler, and by convention the IRQ number `0` is the default device, which reports accesses to unmapped addresses (see [`__irq_dfltdev()`](#__irq_dfltdev)).
 
 Back-to-back pending interrupts are dispatched within a single trap entry on the live saved context ("tail-chaining", see [Scheduler internals](#scheduler-internals)): consecutive timer and IRQ callbacks may run without the interrupted context being restored and re-saved in between. This is transparent to callback authors — the callback context restrictions above already cover it.
 
@@ -250,6 +250,20 @@ void _irq_unregister(_irq_t *i); // Unregister an interrupt handler.
 | Name | Description                     |
 |------|---------------------------------|
 | `i`  | Initialized `_irq_t` descriptor |
+
+### `__irq_dfltdev()`
+
+```c
+void __irq_dfltdev(uintptr_t addr); // Weak: called for an access to an unmapped address.
+```
+
+On the FPGA SoCs, the bus slave that catches an access to an address no device maps (the default device, `dev/dfltdev.sv`) acknowledges the access, records its address and raises interrupt source `0`; the runtime enables that source at boot and, when the interrupt is dispatched, reads the recorded address and calls `__irq_dfltdev()` with it. The default definition is weak: it prints `==== OOPS CPU<n> 0x<pc> dfltdev 0x<addr> ====` and halts the system (or breaks into the debugger when the GDB stub is linked). An application defines the function to handle the fault instead, under the [callback context](#interrupt) rules; it can be called on any CPU.
+
+| Name   | Description |
+|--------|-------------|
+| `addr` | The address as seen on the bus: the bits beyond the address bus width are or-reduced into its most significant bit, which is then sign-extended, so an address beyond the bus reads as a negative value and the address is exact only when it fits the bus or the same-size window at the top of the address space (e.g. on a 1 MiB bus window, `0x80000004` reads `0xfff80004`, `(void *)-4` reads `0xfffffffc`). The device records the first faulty address since it was last read; further faults before that read raise the interrupt again but are not recorded. |
+
+The interrupt is asynchronous: `_trap_savedctx()->epc` is only close to the faulty access, and on a multi-CPU system it can belong to a CPU other than the one that faulted. A faulting load reads back `0x00000013` (a NOP) and instructions fetched from an unmapped address execute as NOPs, so a handler that returns after a fetch fault resumes that NOP stream unless it changes the saved pc or terminates the thread. A fault raised while interrupts are disabled is reported once they are enabled again. In rv32-sim, an unmapped access still terminates the simulation with a `!!! s_wbpi_addr_w[S_WBPI_DEFAULT]` line instead.
 
 ---
 
@@ -559,7 +573,7 @@ void _thread_schedall(_waitq_t *wq); // Wake all threads in the queue, oldest fi
 ## Scheduler internals
 
 - **Per-CPU runqueues** — each CPU owns a circular runqueue of `_THREAD_RUNNING` threads and schedules round-robin through it.
-- **Timeslicing** — when a runqueue holds more than one thread, a per-CPU scheduling timer preempts the current thread after `SCHEDLRHZ / nthreads` cycles (`SCHEDLRHZ` defaults to 50 ms worth of cycles), which bounds the time a preempted thread waits to resume by `SCHEDLRHZ`. A thread preempted early (e.g. by a wake-up) keeps its remaining timeslice in `timeleft` and gets it back the next time it runs. With a single runnable thread, the scheduling timer is disarmed — a purely event-driven regime with zero scheduling overhead.
+- **Timeslicing** — when a runqueue holds more than one thread, a per-CPU scheduling timer preempts the current thread after `SCHEDLRHZ / nthreads` cycles (`SCHEDLRHZ` defaults to 50 ms worth of cycles), which bounds the time a preempted thread waits to resume by `SCHEDLRHZ`. A thread preempted early (e.g. by a wake-up) keeps its remaining timeslice in `timeleft` and, the next time it runs, runs for it instead of a new timeslice, bounded by `SCHEDLRHZ / nthreads`. With a single runnable thread, the scheduling timer is disarmed — a purely event-driven regime with zero scheduling overhead.
 - **Load balancing** — `_thread_sched()` places the thread on the runqueue with the fewest threads, unless the thread is pinned (`pin`) or the system has a single CPU.
 - **IPIs** — scheduling operations targeting another CPU kick it with an inter-processor interrupt through the interrupt controller (reserved IRQ number `-1`).
 - **Idle** — a CPU with an empty runqueue parks in `wfi` inside the trap handler with a null thread pointer, waking on the next timer or external interrupt.
@@ -570,9 +584,13 @@ void _thread_schedall(_waitq_t *wq); // Wake all threads in the queue, oldest fi
 
 ## Boot & memory layout
 
-**Boot flow (`crt0.S`)** — CPU 0 initializes `gp`, the trap vector, and the trap-disabled state, then: saves a pristine copy of `.data` below the top of RAM (or restores `.data` from it on a warm boot, keyed by `__rst_flg` — memory contents persist across reset), zeroes `.bss`, carves the main thread's TLS image and `_thread_t` from the top of the stack, records `__heap_ptr = _end` and `__heap_end = sp`, and calls `__init_multithreading()` — which registers the IPI handler, releases the secondary CPUs one at a time (each increments `__ncpu`), and initializes the runqueues — before running the usual libc init and `main()`. Harts with `mhartid >= NCPU` (the compile-time CPU maximum) park immediately.
+**Boot flow (`crt0.S`)** — CPU 0 initializes `gp`, the trap vector, and the trap-disabled state, then: takes the end of memory from register `a1` when a loader marked the reset (see the end of memory from a loader below), oopses if memory ends below `_end` (see the boot-time RAM check below), saves a pristine copy of `.data` below the top of RAM (or restores `.data` from it on a warm boot, keyed by `__rst_flg` — memory contents persist across reset), reading and writing every word with atomic accesses, which go straight to memory: the copy reaches memory (a reset discards the dcache's dirty words) and no word of `.data` stays in the boot CPU's data-cache (see [Atomic operations](#atomic-operations)), calls the `__gdbstub_boot()` hook (a no-op unless the gdbstub has a program reload pending, see the GDB stub section), zeroes `.bss` with atomic stores, likewise leaving no word of it cached (up to `__bss_end`, `.noinit` untouched), carves the main thread's TLS image and `_thread_t` from the top of the stack, records `__heap_ptr = _end` and `__heap_end = sp` (oopsing first if that would invert them), and calls `__init_multithreading()` — which registers the IPI handler, releases the secondary CPUs one at a time through `__ncpu_rendezvous` (each released hart increments `__ncpu`, then releases the next), and initializes the runqueues — before running the usual libc init and `main()`. Harts with `mhartid >= NCPU` (the compile-time CPU maximum) park immediately.
 
-**Secondary CPUs** wait for `__ncpu == mhartid`, briefly use a temporary trap stack below `__heap_end`, then switch to their per-CPU trap stack in `__trap_stacks[NCPU][TRAP_STACK_SIZE]` and park idle in `wfi` until scheduling work arrives.
+**End of memory from a loader** — a reset writes no register but `sp`, which it sets to the end of memory, so a loader starting the image by a system reset (ie: `apps/bootldr` of the FPGA tops) can give it another end of memory in register `a1`, marking its reset with `ra` = -1, which no link can be, and `a0` null; a null `a1` keeps the reset's end. The cold boot then uses `a1` as the end of memory, below which it copies `.data` and carves the stack, and keeps it in `__rst_sp`; the warm boots take it from there, as a later reset leaves the registers as they were. `apps/bootldr` gives the address of the stack data it stores right below the end of the memory to use (ie: a device tree blob), which the program then finds at `__rst_sp` (`extern uintptr_t __rst_sp;`), or that end when a board function moved it. The oops check of a warm boot uses the reset's end of memory, before `__rst_sp` is read: an image ending beyond it boots cold only.
+
+**Secondary CPUs** wait for `__ncpu_rendezvous == (mhartid ^ RENDEZVOUS_MAGIC)` — a magic value rather than the plain count, so that stale memory (ie: an image being loaded over the running one) cannot release a hart early; `__ncpu` stays the count — briefly use a temporary trap stack below `__heap_end`, then switch to their per-CPU trap stack in `__trap_stacks[NCPU][TRAP_STACK_SIZE]` — kept in `.noinit`, a stack being written before it is read, and 16-byte aligned as the ABI requires of `sp` — and park idle in `wfi` until scheduling work arrives.
+
+**Sections that survive a reset** — `.noinit` (`__attribute__((noinit))`) is neither zeroed at boot nor part of the loaded image (the linker marks it NOLOAD), so its contents persist across warm boots and reloads alike (the per-CPU trap stacks live there too, not to persist but to spare the boot the clearing of memory that is written before it is read); `.persistent` (`__attribute__((section(".persistent")))`) is not zeroed at boot either and lies outside the pristine `.data` copy, so it persists across warm boots but takes the image's initial value again whenever the image is loaded (the gdbstub's reload flag lives there). Both are placed by the linker between `.data` and `_end`, `.persistent` just before `__bss_start` and `.noinit` just after `__bss_end`; neither is initialized by the boot, so an atomically manipulated variable in either must be initialized atomically by the program, as one in runtime-allocated memory (see [Atomic operations](#atomic-operations)).
 
 **Memory layout** (addresses growing upward):
 
@@ -594,6 +612,13 @@ void _thread_schedall(_waitq_t *wq); // Wake all threads in the queue, oldest fi
 > [!WARNING]
 > The heap (`_sbrk()`) grows up toward `__heap_end` while the main thread's stack grows down from it — **there is no guard between them**; a deep main-thread stack and a large heap can silently collide. Threads created with `_thread_create()` use their own stacks and are not affected.
 
+**Boot-time RAM check** — `crt0.S` oopses instead of booting when memory is too small:
+
+- `OOPS1` — memory ends below `_end`: the image does not fit. Checked at the very start of the CPU 0 path, before the first memory access: an access outside of memory terminates rv32-sim, and on the FPGA SoCs it is only reported by the default device interrupt once the runtime has enabled it, long after the damage.
+- `OOPS2` — the top-of-RAM carve left `sp` below `_end`, ie: we would have had `__heap_end < __heap_ptr`. Checked before the two are stored, so both remain 0.
+
+The oops writes `OOPS1` or `OOPS2` and a newline to the first UART (raw byte stores to `SERIAL0_ADDR`, which work from reset), then nulls `mtvec` and executes `ebreak`, halting the CPU indefinitely (which also ends a simulation). The failure path reads and writes no memory at all; the diagnosis also lives in registers: `a0` holds `0x4f4f5001`/`0x4f4f5002` (ascii `"OOP"` plus the reason), `a1` the `__heap_ptr` value (`_end`), `a2` the `__heap_end` value (register `sp` at the check — the end of memory for `OOPS1`), and the program counter parks at `__oops_ram`/`__oops` in `crt0.S`; the oops always means `a2 < a1`. This positively distinguishes a too-small memory from an unmapped access reported by the default device (`dfltdev` in the oops line, see [`__irq_dfltdev()`](#__irq_dfltdev)), from a bus wedge on a device holding its bus busy (no output, CPU frozen mid-access, not halted) and from the idle `wfi` parks (which run with interrupts enabled).
+
 **TLS** — the `_thread_t` of every thread doubles as the first thread-local object: the linker script places the reserved `.tdata.__thread_cur` section at TLS offset 0, *before* the `__tdata_start` marker, so the runtime TLS copies exclude it while compiled TLS accesses (offsets from the `tp` register, which points to the `_thread_t`) line up. Each thread's TLS image and `_thread_t` are carved from the top of its stack by `_thread_create()`/`crt0`.
 
 ---
@@ -612,22 +637,27 @@ void _thread_schedall(_waitq_t *wq); // Wake all threads in the queue, oldest fi
 - `_thread_stop()` acting on a thread currently running on another CPU spins (with IRQs disabled) until that CPU preempts it; two CPUs concurrently doing this to each other's current threads deadlock. Avoid symmetric cross-CPU stop patterns.
 - A terminated thread reports `_is_thread_terminated()` slightly before its CPU finishes switching away from it; delay `_thread_dispose()` accordingly when the freed stack could be reallocated immediately (context *restore* is fully handshaked via `_thread_t.ctxsaved`, but disposal is not).
 - The TLS setup assumes `.tbss` immediately follows `.tdata` with no alignment gap, and honors TLS alignment only up to the pointer size; avoid over-aligned (`> XLEN`) thread-local variables.
-- The heap/main-stack boundary is unguarded (see [Boot & memory layout](#boot--memory-layout)).
+- The heap/main-stack boundary is unguarded at run time; only the boot-time memory size is checked (see [Boot & memory layout](#boot--memory-layout)).
 
 ---
 
 ## CPU & trap helpers
 
-### `_cpuid()` / `_clkfreq()` / `_clkcycles()` / `_ncpu()` / `_oops()`
+### `_cpuid()` / `_clkfreq()` / `_clkcycles()` / `_ncpu()` / `_oops()` / `_sysreset()`
 
 ```c
 #define _cpuid()          // Get the current CPU ID (mhartid).
 #define _clkfreq()        // Get system clock frequency in Hz (custom CSR 0xcc0).
 _date_t _clkcycles(void); // Read current 64-bit clock cycle counter.
 uintptr_t _ncpu(void);    // Returns the number of CPUs that have booted.
-#define _oops()           // Fatal error: prints the CPU and PC, then halts the system
-                          // (breaks into the debugger instead when the GDB stub is linked).
+#define _oops()           // Fatal error: prints "==== OOPS CPU<n> 0x<pc> ====", then halts the
+                          // system (breaks into the debugger instead when the GDB stub is linked).
+void _sysreset(void);     // Reset the system through the interrupt controller; never returns.
 ```
+
+A boot-time failure uses a distinct signature (`OOPS1`/`OOPS2`) — see [Boot & memory layout](#boot--memory-layout). An access to an unmapped address prints `==== OOPS CPU<n> 0x<pc> dfltdev 0x<addr> ====` — see [`__irq_dfltdev()`](#__irq_dfltdev).
+
+`_sysreset()` disables interrupts on the calling CPU, requests the reset from the interrupt controller (`CMDINTDST` with the destination `-1`), retrying until the controller accepts the request, then parks in `wfi` until the reset asserts: every CPU, device and cache resets and the image boots again warm (`.data` restored from its pristine copy, `.bss` zeroed, `.noinit` and `.persistent` kept — see [Boot & memory layout](#boot--memory-layout)). It is part of every image and retained through the linker's section garbage collection, so a debugger can always jump to it. A reset discards the dirty words of the write-back data cache: a value meant to be seen after the reset must be written with an atomic operation such as `_xchg()`, which goes straight to memory.
 
 ### `_trap_savedctx()`
 
@@ -649,10 +679,11 @@ Linking `-lgdbstub` embeds a GDB Remote-Serial-Protocol stub (`_os_gdbstub.c`, b
 - Software breakpoints (gdb plants `ebreak` itself through memory writes).
 - Single-step, implemented stub-side (gdb itself provides no software single-step for bare-metal RISC-V targets): temporary `ebreak` are planted at the successor instructions; an `lr.w`/`sc.w` sequence is stepped over as a whole so the reservation is never destroyed; another thread hitting a step plant is held silently until the step ends.
 - `Ctrl-C` stops the selected thread (SIGINT); everything else keeps running.
-- Memory and register read/write, `detach`/re-attach (`detach` resumes every thread the stub stopped).
+- Memory and register read/write, `detach`/re-attach (`detach` resumes every thread the stub stopped, once each).
 - Every exception becomes a debugger stop of the faulting thread instead of a `while(1)` hang: illegal instruction → SIGILL, misaligned load/store/jump → SIGBUS, access/page faults → SIGSEGV (where the hardware raises them), unexpected `ecall` → SIGTRAP.
 - `_oops()` prints its banner then drops into the frozen emergency session (SIGTRAP) instead of halting the system.
 - An `ebreak` executed before gdb ever attached parks that thread awaiting the debugger.
+- A program which has finished stays attachable: with the stub linked, `_exit()` — reached by `exit()` and by a return from `main()` — parks the exiting thread awaiting the debugger instead of nulling `mtvec` and halting the CPU, its exit status readable as the parked context's `a0`; `set var __gdbstub_tp = __gdbstub_next()` adopts it, resting on the `ebreak` of `_exit`. The image can still be reloaded (see *Loading a new program* below). A simulation of such an image therefore no longer ends when the program exits; a stub-less image halts, and ends the simulation, as before. `detach` resumes that thread like every other one it stopped, but the `ebreak` being real code it traps again at once, hence a finished program is found parked again on the next attach; to actually move on from one, `reload` it (see *Loading a new program* below) or reset the board.
 
 **Per-thread debugging** — the wire protocol stays the plain single-threaded RSP; the whole thread user-interface is one stub global plus two stub functions driven from gdb:
 
@@ -666,7 +697,7 @@ Linking `-lgdbstub` embeds a GDB Remote-Serial-Protocol stub (`_os_gdbstub.c`, b
 
       (gdb) set var __gdbstub_tp = __gdbstub_next()
 
-  which resumes the previously selected thread and adopts the oldest stopped one (the debug-shell when none is queued); `set var __gdbstub_tp = __gdbstub_last()` selects back the thread most recently resumed (unlike the drain, it resumes nothing: the thread being switched away from stays as it was); `print __gdbstub_parked` lists the stub-parked threads. Suggested convenience defines:
+  which resumes the previously selected thread and adopts the oldest stopped one (the debug-shell when none is queued); `set var __gdbstub_tp = __gdbstub_last()` selects back the thread most recently resumed (unlike the drain, it resumes nothing: the thread being switched away from stays as it was); `print __gdbstub_parked` lists the stub-parked threads. Suggested convenience defines (the hardware repository ships them — with a `gx <_thread_t *>` direct selector and the session settings: `arch`, `remotetimeout`, `always-inserted` — as `tools/underLineOS.gdb` for `gdb -x`):
 
       define gn
         set var __gdbstub_tp = __gdbstub_next()
@@ -684,7 +715,7 @@ Common prompt recipes:
 - Stop a specific thread: `set var __gdbstub_tp = thrd_x`, `continue`, then `Ctrl-C`.
 - Resume the selection and get the prompt back (rather than awaiting its next stop): drain with `set var __gdbstub_tp = __gdbstub_next()` — the selection resumes and the oldest queued stop (or the debug-shell) gets selected. This is also how a manually stopped thread is resumed: select it, then drain.
 - Resume everything the stub stopped without detaching: for each entry of `print __gdbstub_parked` (the debug-shell excepted), select it then drain; `detach` + re-attach does it in one step.
-- Park a thread for the debugger before gdb ever attached: execute `__asm__ __volatile__ ("ebreak")` in it; once attached, drain to adopt it, and — the `ebreak` being real code, not a gdb breakpoint — skip it before resuming: `set var $pc = $pc + 4`.
+- Park a thread for the debugger before gdb ever attached: execute `__asm__ __volatile__ ("ebreak")` in it; once attached, drain to adopt it, and — the `ebreak` being real code, not a gdb breakpoint — skip it before resuming: `set var $pc = $pc + 4`. Without that skip the thread re-parks on the same `ebreak` as soon as anything resumes it, a `detach` included.
 
 **Emergency session** — contexts which cannot be parked drop into a synchronous session servicing gdb from within the trap with the whole machine frozen; `continue` unfreezes. This covers: nested traps (ie: `_oops()`, or a breakpoint inside a trap/interrupt handler or timer callback), the idle context, the stub engine itself (ie: a breakpoint planted in stub internals), faults before the stub constructor ran, a full parked list, and any context interrupted with IRQs disabled (ie: a breakpoint inside a spinlock/`_preempt_disable` critical section, scheduler internals included — they are steppable, just with the world frozen). An `_oops()` reached while gdb sits at its prompt sends nothing unsolicited: gdb keeps displaying its cached registers; run `maintenance flush register-cache` (then `bt`) to see the frozen context — memory reads are live either way.
 
@@ -695,14 +726,35 @@ LDFLAGS += -Wl,--defsym=_gdbstub_dev=0xf88     # Device base (command register a
 LDFLAGS += -Wl,--defsym=_gdbstub_irq=1         # irqctrl source index. Default 1.
 LDFLAGS += -Wl,--defsym=_gdbstub_membeg=0x1000 # gdb memory-access low bound. Default 0x1000 (RAM start).
 LDFLAGS += -Wl,--defsym=_gdbstub_memend=0      # gdb memory-access high bound. Default 0 selects
-                                               # __heap_end rounded up to 1KB (just below the RAM top;
-                                               # the boot carve-out above __heap_end may be partially
-                                               # excluded).
+                                               # __heap_end rounded up to 1KB: the pristine .data copy
+                                               # and the main thread's TLS/_thread_t carve-out above
+                                               # __heap_end are never accessible (the initial thread
+                                               # pointer is accepted anyway).
 ```
 
-Do **not** retarget these by defining a strong C variable (`void *_gdbstub_dev = (void *)0xf88;`): the stub reads the symbol's *address*, so a strong variable makes it read that variable's storage location rather than `0xf88`, which hangs the bus. `--defsym` (or an equivalent absolute `.set` in a *separate* object) is the only working way — a default written inside the stub's own translation unit would be baked into the code as an immediate by the optimizer and could no longer be overridden. `0` is the "unset" sentinel, so `_gdbstub_irq` cannot select source 0 (the console source, never a gdb transport anyway).
+Do **not** retarget these by defining a strong C variable (`void *_gdbstub_dev = (void *)0xf88;`): the stub reads the symbol's *address*, so a strong variable makes it read that variable's storage location rather than `0xf88`, which hangs the bus. `--defsym` (or an equivalent absolute `.set` in a *separate* object) is the only working way — a default written inside the stub's own translation unit would be baked into the code as an immediate by the optimizer and could no longer be overridden. `0` is the "unset" sentinel, so `_gdbstub_irq` cannot select source 0 (by convention the default device source, never a gdb transport anyway).
 
-Out-of-bounds gdb memory requests get error replies — an unmapped bus access would terminate rv32-sim.
+Out-of-bounds gdb memory requests get error replies — an unmapped bus access would terminate rv32-sim, or raise the default device interrupt on the FPGA SoCs.
+
+**Loading a new program** — a running image linked with `-lgdbstub` can be replaced from gdb: the stub cannot serve a `load` over itself (the loaded image overwrites its code), so the boot takes over. Setting `__gdbstub_reload` (any non-null value, written atomically — gdb's `set var` goes through the stub's coherent memory write) and resetting the SoC parks the next boot in a small position-independent loader, copied below the stack by the `__gdbstub_boot()` hook that `crt0` calls once `.data` is saved or restored: it prints `gdbstub: awaiting gdb (load then continue, or continue)` on the console and serves gdb's `load` into `[_gdbstub_membeg, loader)`. The `reload` command of `tools/underLineOS.gdb` triggers it from the prompt — sets the flag, reads it back, sets `$pc` to `_sysreset()` and continues; the SoC resets, gdb keeps waiting for a stop reply until `Ctrl-C` reaches the loader, which reports its own address as `$pc` (gdb shows `?? ()`). Then `file`, `load`, `continue`: the loader starts the loaded image by another reset — every CPU, device and cache resets, `.persistent` takes the loaded image's values (its flag included) — and the new image boots cold, its stub again reporting nothing until `Ctrl-C` (`set var __gdbstub_tp = __gdbstub_next()` adopts a queued stop). From code, `_xchg(&__gdbstub_reload, 1); _sysreset();` requests the same (a plain store to the flag would be discarded by the reset with the rest of the dirty dcache).
+
+```
+(gdb) delete                                  # an inserted ebreak would be carried into the loaded image
+(gdb) reload                                  # flag set and read back, $pc = _sysreset, continue
+^C                                            # 0x... in ?? (): the loader
+(gdb) file apps/helloworld/helloworld.elf
+(gdb) load
+(gdb) continue                                # or continue alone: reboot the current image warm
+```
+
+- Delete the breakpoints first: an inserted `ebreak` of the old image survives the warm reset, and gdb re-patches every inserted breakpoint into the `load` writes covering it; one in a boot path traps before the hook, into the old image's emergency session. (Left in place on purpose, a breakpoint carried into the same image parks the thread hitting it at the next boot, to be drained after `Ctrl-C`.)
+- `continue` with nothing loaded reboots the current image warm: the hook cleared the flag.
+- Refused: a `load` from the running stub — its first packet, the write covering `_start`, gets an error and gdb prints `Load failed`; an image reaching the loader region (which sits below the stack top) — `Load failed` again: retry `load` with a smaller image and never reset, the half-written `.text` being what would boot. An image whose crt0 predates the hook boots normally; a stub-less image runs after `continue` but gdb loses contact.
+- `Ctrl-C` during a `load` cancels it on gdb's side (`Canceled the download`), the loader survives: re-run `load`. A reset or a gdb death mid-load leaves memory half-loaded: reflash the SoC or restart the sim.
+- In the loader use only `file`, `load`, `compare-sections`, `x`/`print` within the bounds and `continue`: `stepi` is a no-op, `step`/`next` spin until `Ctrl-C`, `finish` has no frame, `until`/`advance` plant an `ebreak` the loader accepts and the reset carries into the image; `set $pc` is recorded but ignored, the image always starting by a reset. `detach` succeeds and the loader keeps waiting (a fresh `target remote` re-attaches); `quit` leaves it waiting too.
+- A flag left set — a crash after `reload`, or a power cycle that kept the RAM contents — parks the next warm boot in the loader, which says so on the console: that state is the recovery path, not a hang; `continue` reboots.
+- On more than one CPU the stub is out of its scope (see the limitations): `reload` may leave the selection's resume point untouched when that context is a cooperative one; the reset request from code, or the reset button after `set var __gdbstub_reload = 1`, still lead to the loader.
+- Binary `X` packets and no-ack mode are future speedups; the stub and the loader must gain them together, gdb probing each once per connection.
 
 **Usage with rv32-sim** — the pty must exist before the sim starts, and gdb opens the *other* end of the socat pair:
 
@@ -710,7 +762,7 @@ Out-of-bounds gdb memory requests get error replies — an unmapped bus access w
 socat pty,link=/tmp/ttyGDB0,raw,echo=0 pty,link=/tmp/ttyGDB1,raw,echo=0 &
 make clean sim run SERIAL_PTY0=/tmp/ttyGDB0 SERIAL_PTY_POLLCYCLES=64 \
     SRAM_INITFILE=apps/gdbstubtest/gdbstubtest.32.hex
-riscv32-unknown-elf-gdb -nx -ex 'set arch riscv:rv32' -ex 'set remotetimeout unlimited' \
+riscv32-unknown-elf-gdb -nx -x ../tools/underLineOS.gdb \
     -ex 'file apps/gdbstubtest/gdbstubtest.elf' -ex 'target remote /tmp/ttyGDB1'
 ```
 
@@ -726,7 +778,7 @@ riscv32-unknown-elf-gdb -nx -ex 'set arch riscv:rv32' -ex 'set remotetimeout unl
 - At most 16 threads (the debug-shell included) can be stub-parked at once — queued stops, `Ctrl-C` parks and step-suppressed holds share the slots. A thread stopping with the list full drops into the frozen emergency session instead, and `Ctrl-C` degrades to report-only; drain with `__gdbstub_next()`/`detach` to free slots.
 - A breakpoint deleted while a queued (unreported) hit of it exists reports a spurious SIGTRAP when that stop is drained — just `continue`.
 - An inferior call that blocks wedges its host thread until `Ctrl-C`; the engine stays alive throughout.
-- Threads are resumed one at a time (the selection); `detach` resumes everything the stub stopped.
+- Threads are resumed one at a time (the selection); `detach` resumes everything the stub stopped, each thread once: one at rest on an `ebreak` of the program itself re-parks immediately, which is why it is still parked on the next attach.
 - A breakpoint placed inside an `lr.w`/`sc.w` sequence livelocks it: every hit kills the reservation, hence the `sc.w` can never succeed until the breakpoint is deleted (single-stepping is safe: the stepper jumps the sequence as a whole).
 - Writing code whose dcache line also holds data the program dirties can lose a breakpoint on eviction.
-- If gdb dies without detaching, its planted `ebreak` remain: the next hit parks that thread awaiting re-attach (attach then drains it as usual).
+- If gdb dies without detaching, its planted `ebreak` remain: the next hit parks that thread awaiting re-attach (attach then drains it as usual). A reply it never acknowledged is given up on after two seconds, so the stub is serviceable again by the time the next gdb attaches.
